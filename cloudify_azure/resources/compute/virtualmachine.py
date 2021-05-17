@@ -39,9 +39,57 @@ from azure_sdk.resources.network.network_interface_card import \
 from azure.mgmt.compute.models import (
     NetworkProfile,
     NetworkInterfaceReference)
+from ..storage.disk import data_disk_exists
+from msrestazure.azure_exceptions import CloudError
+from azure_sdk.resources.storage.storage_account import StorageAccount
+from azure.storage.common.cloudstorageaccount import CloudStorageAccount
+from cloudify.exceptions import RecoverableError
 
 PS_OPEN = '<powershell>'
 PS_CLOSE = '</powershell>'
+
+
+def get_cloud_storage_account(storage_account_name, ctx):
+    """Gets the Azure Blob storage service"""
+    # Get the storage account
+    resource_group_name = utils.get_resource_group(ctx)
+    azure_config = ctx.node.properties.get("azure_config")
+    if not azure_config.get("subscription_id"):
+        azure_config = ctx.node.properties.get('client_config')
+    else:
+        ctx.logger.warn("azure_config is deprecated please use client_config, "
+                        "in later version it will be removed")
+    # Get the storage account keys
+    keys = StorageAccount(azure_config, ctx.logger).list_keys(
+        resource_group_name, storage_account_name)
+    if not keys or not keys.get("key1"):
+        raise RecoverableError(
+            'StorageAccount reported no usable authentication keys')
+    # Get an interface to the Storage Account
+    storage_account_key = keys.get("key1")
+    return CloudStorageAccount(
+        account_name=storage_account_name,
+        account_key=storage_account_key)
+
+
+def vhd_exists(ctx, uri):
+    storage_account_name = uri.split('/')[-3].split('.')[0]
+    csa = get_cloud_storage_account(storage_account_name, ctx=ctx)
+    pageblobsvc = csa.create_page_blob_service()
+    disk_container, disk_name = uri.split('/')[-2:]
+    return data_disk_exists(pageblobsvc, disk_container, disk_name)
+
+
+def get_vm(ctx, name):
+    azure_config = utils.get_client_config(ctx.node.properties)
+    api_version = \
+        ctx.node.properties.get('api_version', constants.API_VER_COMPUTE)
+    resource_group_name = utils.get_resource_group(ctx)
+    vm_iface = VirtualMachine(azure_config, ctx.logger, api_version)
+    try:
+        return vm_iface.get(resource_group_name, name)
+    except CloudError:
+        return None
 
 
 def build_osdisk_profile(ctx, usr_osdisk=None):
@@ -332,6 +380,22 @@ def create(ctx, args=None, **_):
     # Remove custom_data from os_profile if empty to avoid Errors.
     elif 'custom_data' in resource_create_payload['os_profile']:
         del resource_create_payload['os_profile']['custom_data']
+    # attach os_disk if it already exists
+    vhd_uri = resource_create_payload.get('storage_profile', dict())\
+        .get('os_disk', dict()).get('vhd', dict()).get('uri')
+    payload_to_fix = resource_create_payload.get('storage_profile', dict())\
+        .get('os_disk', dict()).get('create_option') \
+        in ['FromImage']  # applies to more too
+    vhd = vhd_exists(ctx, vhd_uri)
+    vm_details = get_vm(ctx, name)
+    if (not vm_details or
+        vm_details.get('storage_profile', dict()).get('os_disk', dict())
+            .get('create_option') == 'Attach') and vhd and payload_to_fix:
+        del resource_create_payload['os_profile']
+        resource_create_payload.get('storage_profile', dict()).pop('image_reference', '')
+        resource_create_payload['storage_profile']['os_disk']['create_option'] = 'Attach'
+        resource_create_payload['storage_profile']['os_disk']['os_type'] = 'Windows' if ctx.node.properties.get(
+            'os_family', '').lower() == 'windows' else 'Linux'
     # Create a resource (if necessary)
     try:
         result = \

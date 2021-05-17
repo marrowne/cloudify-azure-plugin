@@ -54,6 +54,7 @@ setup(
         'azure-mgmt-network==10.1.0',
         'azure-mgmt-storage==9.0.0',
         'azure-storage-common==2.1.0',
+        'azure-storage-blob==2.1.0',
         'azure-mgmt-resource==9.0.0',
         'azure-common==1.1.25',
         'msrestazure==0.6.3',
